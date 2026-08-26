@@ -1,0 +1,15 @@
+# 密钥和环境变量
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 每次运行的产物
+work/
+
+# 编辑器/系统
+.codex/
+.agents/
+.DS_Store
+Thumbs.db
