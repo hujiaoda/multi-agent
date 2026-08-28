@@ -15,10 +15,10 @@ def build_llm():
         api_key=apikey,
         base_url=burl,
         max_tokens=10000,
-        timeout=30,
+        timeout=60,
         max_retries=3,
     )
 
 
-# 模块级裸模型：plan / code / review / test 生成文本都用它
+# 模块级裸模型：plan / code / review / test 生成文本
 model = build_llm()

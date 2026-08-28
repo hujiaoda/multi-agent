@@ -14,5 +14,9 @@ class DevTeamState(TypedDict):
     tests_passed: bool #是否通过测试
     attempt_count: int #尝试次数
     workdir: str #本次运行的工作目录（work/<时间戳>/）
+    
+    need_more_info: bool #需求澄清：信息是否足够
+    question: str #需求澄清：要向用户提的问题
+    clarify_count: int #需求澄清轮数
 class agentstate(DevTeamState):
     messages:Annotated[list,add_messages]

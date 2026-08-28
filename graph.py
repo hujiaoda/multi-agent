@@ -10,18 +10,53 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from model import model
 from tools import write_file, run_python_file
 from state import agentstate
-from prompt import planprompt, codeprompt, reviewprompt, testprompt
+from prompt import planprompt, codeprompt, reviewprompt, testprompt, clarifyprompt
 from react import call_model
 from tools import TOOLS_MAP, model_with_tools
+from structured import clarify_model
 MAX_ATTEMPTS = 5
+MAX_CLARIFY = 3
+
+
+def strip_code_fences(text: str) -> str:
+    """去掉模型可能多加的 ```python ... ``` 代码块外壳（安全网）"""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
+def agentclarify(state: agentstate):
+    # 结构化输出：Qwen 返回 ClarifyDecision 对象，bool 和问题都是类型保证的
+    dec = clarify_model.invoke([
+        SystemMessage(clarifyprompt),
+        *state["messages"],
+    ])
+    return {
+        "need_more_info": dec.need_more_info,
+        "question": dec.question,
+        "clarify_count": state.get("clarify_count", 0) + 1,
+    }
+
+
+def should_clarify(state: agentstate):  # clarify 节点的出口
+    if state.get("clarify_count", 0) >= MAX_CLARIFY:
+        return "plan"     # 问太多轮了，按现有信息继续（独立上限，不占重写次数）
+    if state.get("need_more_info", False):
+        return END        # 信息不足 → 结束本轮，main.py 收到问题去问用户
+    return "plan"
 
 
 def agentplan(state: agentstate):
-    msgs = [
+    # 裸模型：plan 只需要生成文字，不能让它看到工具（否则可能返回 tool_calls 导致空计划）
+    msgs=[
             SystemMessage(planprompt),
             HumanMessage(f"用户需求：{state['requirement']}"),
             ]
-    response = call_model(model=model_with_tools, messages=msgs, tools_map=TOOLS_MAP)
+    response = call_model(model=model_with_tools,messages=msgs,tools_map=TOOLS_MAP)
     return {"plan": response.content}
 
 
@@ -36,7 +71,7 @@ def agentcoder(state: agentstate):
     if state.get("test_result"):
         msgs.append(HumanMessage(f"测试结果：{state['test_result']}"))
     response = call_model(model=model_with_tools, messages=msgs, tools_map=TOOLS_MAP)
-    return {"code": response.content}
+    return {"code": strip_code_fences(response.content)}
 
 
 def agentreview(state: agentstate):
@@ -54,29 +89,44 @@ def agentreview(state: agentstate):
 
 
 def agenttest(state: agentstate):
-    # 本次运行的工作目录：work/<时间戳>/（State 里的 workdir 字段）
+    # 本次运行的工作目录：work/<时间戳>/（main.py 生成后放进 State 的 workdir 字段）
     work_dir = Path(state["workdir"])
 
     # ① 被测代码落盘（subprocess 只能跑磁盘文件，不能跑 State 里的字符串）
     write_file(str(work_dir / "target.py"), state["code"])
 
     # ② LLM 生成测试代码（含断言）并落盘
-    test_code = model.invoke([
+    test_code = strip_code_fences(model.invoke([
         SystemMessage(testprompt),
         HumanMessage(f"需求：{state['requirement']}\n代码：{state['code']}"),
-    ]).content
+    ]).content)
+
     write_file(str(work_dir / "test_target.py"), test_code)
-
-    # ③ subprocess 真跑，机器执行断言
-    result = run_python_file(str(work_dir / "test_target.py"))
-
-    # ④ 判定：退出码 0 = 通过
-    return {
-        "test_result": result["stdout"] + result["stderr"],
-        "tests_passed": result["returncode"] == 0,
-        "attempt_count": state.get("attempt_count", 0) + 1,
+    #判定测试文件本身是否合格
+    test_code=test_code.strip()
+    has_assert = "assert" in test_code
+    has_fallback="无法断言测试"in test_code or "无法测试" in test_code
+    if not test_code:
+        tests_passed=False
+        test_result="测试文件为空,判定失败"
+    elif not has_assert and not has_fallback:
+        tests_passed=False
+        test_result="测试文件没有断言,判定失败"
+    else:
+        #执行测试文件
+        result = run_python_file(str(work_dir / "test_target.py"))
+        if has_fallback:
+            # 降级冒烟：只验证能跑起来（例如游戏类程序）
+            tests_passed = result["returncode"] == 0
+        else:
+            # 真测试：必须跑完且输出完成标记（断言失败会在打印前崩溃）
+            tests_passed = (result["returncode"] == 0) and ("ALL TESTS PASSED" in result["stdout"])
+        test_result = result["stdout"] + result["stderr"]
+    return{
+        "test_result":test_result,
+        "tests_passed":tests_passed,
+        "attempt_count":state.get("attempt_count", 0) + 1,
     }
-
 
 def should_continue(state: agentstate):  # review 节点的出口
     if state.get("attempt_count", 0) >= MAX_ATTEMPTS:
@@ -96,12 +146,17 @@ def should_end(state: agentstate):       # test 节点的出口
 
 graph = StateGraph(agentstate)
 
+graph.add_node("clarify", agentclarify)
 graph.add_node("plan", agentplan)
 graph.add_node("code", agentcoder)
 graph.add_node("review", agentreview)
 graph.add_node("test", agenttest)
 
-graph.set_entry_point("plan")
+graph.set_entry_point("clarify")
+graph.add_conditional_edges("clarify", should_clarify, {
+    "plan": "plan",
+    END: END,
+})
 graph.add_edge("plan", "code")
 graph.add_edge("code", "review")
 graph.add_conditional_edges("review", should_continue, {
