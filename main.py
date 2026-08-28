@@ -2,12 +2,16 @@
 import sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import warnings
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
+
 from datetime import datetime
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
 from graph import app, MAX_CLARIFY
+from tools import set_workspace
 
 DEFAULT_REQU = "写一个命令行版贪吃蛇游戏，用方向键控制，分数实时显示"
 
@@ -28,6 +32,7 @@ def main():
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     work_dir = Path("work") / run_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    set_workspace(str(work_dir))   # 让文件工具的相对路径都落在本次运行目录
     print(f"本次运行目录: {work_dir}\n")
 
     messages = [HumanMessage(requ)]
@@ -48,8 +53,11 @@ def main():
             if mode == "messages":
                 # chunk 是 (消息片段, 元数据)，片段通常是几个字/token
                 msg, metadata = chunk
-                if msg.content:
-                    print(msg.content, end="", flush=True)
+                # 只打印给人看的纯文本；结构化输出的 JSON/工具调用片段跳过
+                if msg.content and not msg.tool_call_chunks:
+                    text = msg.content if isinstance(msg.content, str) else ""
+                    if text.strip() and not text.strip().startswith(("{", "[")):
+                        print(text, end="", flush=True)
             else:  # mode == "updates"
                 # chunk 是 {节点名: 该节点更新的字段}，每次只有一个节点
                 node_name, update = next(iter(chunk.items()))

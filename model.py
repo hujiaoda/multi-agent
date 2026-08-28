@@ -14,9 +14,9 @@ def build_llm():
         temperature=0.7,
         api_key=apikey,
         base_url=burl,
-        max_tokens=10000,
-        timeout=60,
-        max_retries=3,
+        max_tokens=4000,
+        timeout=120,
+        max_retries=2,
     )
 
 

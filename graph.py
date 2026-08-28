@@ -8,11 +8,11 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from model import model
-from tools import write_file, run_python_file
+from tools import write_file, run_python_file, read_file
 from state import agentstate
 from prompt import planprompt, codeprompt, reviewprompt, testprompt, clarifyprompt
 from react import call_model
-from tools import TOOLS_MAP, model_with_tools
+from tools import TOOLS_MAP, model_with_tools, model_with_tools_file, FILE_TOOLS_MAP
 from structured import clarify_model
 MAX_ATTEMPTS = 5
 MAX_CLARIFY = 3
@@ -63,22 +63,39 @@ def agentplan(state: agentstate):
 def agentcoder(state: agentstate):
     msgs = [
         SystemMessage(codeprompt),
-        HumanMessage(f"计划：{state['plan']}\n需求：{state['requirement']}"),
+        HumanMessage(
+            f"计划：{state['plan']}\n需求：{state['requirement']}"
+            f"\n工作目录：{state['workdir']}"
+            f"\n现有文件：{state.get('files') or '（空）'}"
+        ),
     ]
     # 不管是审查还是测试打回来的，把两个字段都给它看，让 LLM 自己分辨
     if state.get("review"):
         msgs.append(HumanMessage(f"审查意见：{state['review']}"))
     if state.get("test_result"):
         msgs.append(HumanMessage(f"测试结果：{state['test_result']}"))
-    response = call_model(model=model_with_tools, messages=msgs, tools_map=TOOLS_MAP)
-    return {"code": strip_code_fences(response.content)}
+
+    # 模型通过文件工具自己读写磁盘；最后的文字回答只作总结
+    # max_turns 放宽：复杂项目可能要写多个文件，5 轮不够
+    call_model(model=model_with_tools_file, messages=msgs, tools_map=FILE_TOOLS_MAP, max_turns=8)
+
+    # 跑完确定性记录：工作目录里现在有哪些文件
+    files = sorted(f.name for f in Path(state["workdir"]).rglob("*") if f.is_file())
+    return {"files": files, "entry_file": "main.py"}
 
 
 def agentreview(state: agentstate):
+    work_dir = Path(state["workdir"])
+    files = state.get("files") or []
+    parts = []
+    for f in files:
+        parts.append(f"===== {f} =====\n{read_file(str(work_dir / f))}")
+    files_text = "\n\n".join(parts) if parts else "（工作目录为空）"
+
     response = model.invoke([
         SystemMessage(reviewprompt),
         HumanMessage(
-            f"需求：{state['requirement']}\n计划：{state['plan']}\n代码：{state['code']}"
+            f"需求：{state['requirement']}\n计划：{state['plan']}\n工作目录文件：\n{files_text}"
         ),
     ])
     return {
@@ -91,29 +108,35 @@ def agentreview(state: agentstate):
 def agenttest(state: agentstate):
     # 本次运行的工作目录：work/<时间戳>/（main.py 生成后放进 State 的 workdir 字段）
     work_dir = Path(state["workdir"])
+    entry_file = state.get("entry_file") or "main.py"
 
-    # ① 被测代码落盘（subprocess 只能跑磁盘文件，不能跑 State 里的字符串）
-    write_file(str(work_dir / "target.py"), state["code"])
+    # ① 入口文件必须存在（编码节点通过工具写盘）
+    if not (work_dir / entry_file).exists():
+        return {
+            "test_result": f"入口文件不存在: {entry_file}",
+            "tests_passed": False,
+            "attempt_count": state.get("attempt_count", 0) + 1,
+        }
 
-    # ② LLM 生成测试代码（含断言）并落盘
+    # ② LLM 生成测试代码（import 入口模块）并落盘
     test_code = strip_code_fences(model.invoke([
         SystemMessage(testprompt),
-        HumanMessage(f"需求：{state['requirement']}\n代码：{state['code']}"),
+        HumanMessage(f"需求：{state['requirement']}\n入口文件：{entry_file}\n代码见工作目录：{work_dir}"),
     ]).content)
 
     write_file(str(work_dir / "test_target.py"), test_code)
-    #判定测试文件本身是否合格
-    test_code=test_code.strip()
+    # 判定测试文件本身是否合格
+    test_code = test_code.strip()
     has_assert = "assert" in test_code
-    has_fallback="无法断言测试"in test_code or "无法测试" in test_code
+    has_fallback = "无法断言测试" in test_code or "无法测试" in test_code
     if not test_code:
-        tests_passed=False
-        test_result="测试文件为空,判定失败"
+        tests_passed = False
+        test_result = "测试文件为空,判定失败"
     elif not has_assert and not has_fallback:
-        tests_passed=False
-        test_result="测试文件没有断言,判定失败"
+        tests_passed = False
+        test_result = "测试文件没有断言,判定失败"
     else:
-        #执行测试文件
+        # 执行测试文件
         result = run_python_file(str(work_dir / "test_target.py"))
         if has_fallback:
             # 降级冒烟：只验证能跑起来（例如游戏类程序）
@@ -122,10 +145,10 @@ def agenttest(state: agentstate):
             # 真测试：必须跑完且输出完成标记（断言失败会在打印前崩溃）
             tests_passed = (result["returncode"] == 0) and ("ALL TESTS PASSED" in result["stdout"])
         test_result = result["stdout"] + result["stderr"]
-    return{
-        "test_result":test_result,
-        "tests_passed":tests_passed,
-        "attempt_count":state.get("attempt_count", 0) + 1,
+    return {
+        "test_result": test_result,
+        "tests_passed": tests_passed,
+        "attempt_count": state.get("attempt_count", 0) + 1,
     }
 
 def should_continue(state: agentstate):  # review 节点的出口

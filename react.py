@@ -30,7 +30,11 @@ def call_model(model, messages, tools_map, max_turns=5):
         # 模型想调工具 → 逐个执行，把结果以 ToolMessage 喂回去
         for tc in response.tool_calls:
             fn = tools_map[tc["name"]]
-            result = fn.invoke(tc["args"])
+            print(f"\n[工具] {tc['name']}({str(tc['args'])[:80]}...)", flush=True)
+            if hasattr(fn, "invoke"):
+                result = fn.invoke(tc["args"])   # @tool 对象
+            else:
+                result = fn(**tc["args"])        # 普通函数
             messages.append(ToolMessage(
                 content=str(result),
                 tool_call_id=tc["id"],
