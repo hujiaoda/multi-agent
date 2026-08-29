@@ -8,6 +8,10 @@ __pycache__/
 # 每次运行的产物
 work/
 
+# 个人交接文档（保留本地，不同步到 GitHub）
+待做事项.txt
+交接文档.md
+
 # 编辑器/系统
 .codex/
 .agents/
