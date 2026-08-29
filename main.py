@@ -16,17 +16,27 @@ from tools import set_workspace
 DEFAULT_REQU = "写一个命令行版贪吃蛇游戏，用方向键控制，分数实时显示"
 
 
-def main():
-    print("请输入需求（多行支持：粘贴后按一个空行结束；直接回车用默认例子）:")
+def read_requirement(input_fn=input) -> str:
+    """读取多行需求：连续两个空行结束；第一行直接回车用默认例子。"""
+    print("请输入需求（多行支持：粘贴后连按两个回车结束；直接回车用默认例子）:")
     lines = []
+    blank_count = 0
     while True:
-        line = input()
+        line = input_fn()
         if not line.strip():
-            break
+            if not lines:
+                break          # 第一行就回车 → 用默认例子
+            blank_count += 1
+            if blank_count >= 2:
+                break          # 连续两个空行 → 输入结束
+            continue           # 单个空行：只是记一笔，继续等
         lines.append(line)
-    requ = "\n".join(lines).strip()
-    if not requ:
-        requ = DEFAULT_REQU
+        blank_count = 0
+    return "\n".join(lines).strip() or DEFAULT_REQU
+
+
+def main():
+    requ = read_requirement()
 
     # 每次运行一个独立文件夹：work/<时间戳>/，不冲突、可追溯
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -42,7 +52,6 @@ def main():
         "messages": messages,
         "clarify_count": 0,
     }
-    # TODO: 多换行输入会被空行截断，待处理
     # 需求澄清循环：clarify 说信息不足 → 打印问题 → 收用户回答 → 重新跑一遍图
     while True:
         final_state = {}
