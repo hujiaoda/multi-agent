@@ -24,20 +24,41 @@ def _get_tavily():
 
 
 def set_workspace(path: str):
-    """设置当前运行的工作目录：相对路径的工具调用都会落到这里"""
+    """设置当前运行的工作目录：所有文件工具只能在这个目录内读写"""
     global _workspace
-    _workspace = Path(path)
+    _workspace = Path(path).resolve()  # 存成绝对路径，沙箱比较基准稳定
 
 
-def _resolve(path: str) -> Path:
-    """路径解析：绝对路径直接用；相对路径拼到工作目录下"""
-    p = Path(path)
-    if p.is_absolute():
-        return p
-    # 模型可能传 work/<时间戳>/xxx.py 这种"完整相对路径"：直接相对项目根目录用
-    if _workspace and p.parts and Path(_workspace).parent.name == p.parts[0]:
-        return p
-    return Path(_workspace) / p if _workspace else p
+def _safe_resolve(path: str) -> Path:
+    """路径沙箱：任何路径先算出最终落点，落点在工作区外就抛错。
+
+    三步：
+    1. 拼接：相对路径 → 补上工作区前缀；绝对路径 → 直接用
+    2. 归一化：resolve() 消掉 ./ 和 ../，变成唯一的绝对路径形式
+    3. 检查：最终落点必须在工作区（含所有子目录）内
+    """
+    if _workspace is None:
+        raise RuntimeError("工作目录未设置，先调用 set_workspace()")
+    raw = Path(path)
+    # 兼容层：模型爱传 work/<时间戳>/xxx.py（相对项目根的完整路径）。
+    # 不剥的话会拼成 工作区/work/<时间戳>/xxx.py，位置错但又不越界。
+    if not raw.is_absolute():
+        try:
+            ws_rel = _workspace.relative_to(Path.cwd()).parts
+        except ValueError:
+            ws_rel = ()  # 工作区不在项目根下（如临时目录），跳过兼容层
+        if len(raw.parts) >= len(ws_rel) and raw.parts[:len(ws_rel)] == ws_rel:
+            raw = Path(*raw.parts[len(ws_rel):])
+    # ① 拼接：相对路径以工作区为锚点
+    target = (raw if raw.is_absolute() else _workspace / raw).resolve()
+    # ② 检查：落点在工作区内 → 放行
+    if target.is_relative_to(_workspace):
+        return target
+    # ③ 越界 → 抛错，由调用方转成给模型看的错误信息
+    raise ValueError(
+        f"路径越界被拦截: {path} → {target}；"
+        f"只允许在工作目录 {_workspace} 内，请改用相对路径如 main.py"
+    )
 
 
 @tool
@@ -48,22 +69,32 @@ def web_search(query: str) -> str:
 
 
 def list_files(dir_path: str) -> list[str]:
-    """列出指定目录下的所有文件（相对项目根目录或绝对路径）。"""
-    p = _resolve(dir_path)
+    """列出指定目录下的所有文件（相对工作目录或绝对路径）。"""
+    try:
+        p = _safe_resolve(dir_path)
+    except ValueError:
+        return []  # 越界目录 → 当空目录处理
     if not p.exists() or not p.is_dir():
         return []
-    return [str(f) for f in p.rglob("*") if f.is_file()]
+    # 返回工作区相对路径：模型看到的文件名，就是它该传给 write_file 的写法
+    return [str(f.relative_to(_workspace)) for f in p.rglob("*") if f.is_file()]
 
 def read_file(filename: str) -> str:
-    """读取指定路径的文件内容（相对项目根目录或绝对路径，UTF-8 编码）。"""
-    p = _resolve(filename)
+    """读取指定路径的文件内容（相对工作目录或绝对路径，UTF-8 编码）。"""
+    try:
+        p = _safe_resolve(filename)
+    except ValueError as e:
+        return f"读取被拒绝：{e}"
     if not p.exists() or not p.is_file():
         return ""
     return p.read_text(encoding="utf-8")
 
 def edit_file(filename: str, old_content: str, new_content: str) -> str:
-    """编辑指定路径的文件内容（相对项目根目录或绝对路径，UTF-8 编码）。"""
-    p = _resolve(filename)
+    """编辑指定路径的文件内容（相对工作目录或绝对路径，UTF-8 编码）。"""
+    try:
+        p = _safe_resolve(filename)
+    except ValueError as e:
+        return f"编辑被拒绝：{e}"
     if old_content == new_content:
         return f"文件 {p} 内容未改变"
     if not p.exists() or not p.is_file():
@@ -75,8 +106,11 @@ def edit_file(filename: str, old_content: str, new_content: str) -> str:
     return f"已编辑 {p}"
 
 def write_file(filename: str, content: str) -> str:
-    """把内容写入指定路径的文件（相对项目根目录或绝对路径，UTF-8 编码）。"""
-    p = _resolve(filename)
+    """把内容写入指定路径的文件（相对工作目录或绝对路径，UTF-8 编码）。"""
+    try:
+        p = _safe_resolve(filename)
+    except ValueError as e:
+        return f"写入被拒绝：{e}"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"已写入 {p}"
@@ -84,10 +118,14 @@ def write_file(filename: str, content: str) -> str:
 
 def run_python_file(path: str) -> dict:
     """用 subprocess 真实执行 Python 文件，返回 returncode / stdout / stderr。"""
+    try:
+        p = _safe_resolve(path)
+    except ValueError as e:
+        return {"returncode": -1, "stdout": "", "stderr": f"运行被拒绝：{e}"}
     # 强制子进程用 UTF-8 输出，否则 Windows 上中文输出按 GBK 编码会导致解码崩溃
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     result = subprocess.run(
-        ["python", path],
+        ["python", str(p)],
         capture_output=True,
         text=True,
         encoding="utf-8",
