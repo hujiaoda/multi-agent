@@ -1,4 +1,4 @@
-"""工具集：web_search（LLM 决策用）/ write_file / run_python_file（节点直接调用）"""
+"""工具集：web_search（LLM 决策用）/ 文件读写 / run_file 按语言运行（节点直接调用）"""
 import sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -116,28 +116,56 @@ def write_file(filename: str, content: str) -> str:
     return f"已写入 {p}"
 
 
-def run_python_file(path: str) -> dict:
-    """用 subprocess 真实执行 Python 文件，返回 returncode / stdout / stderr。"""
+def _run_cmd(cmd: list[str], timeout: int = 30) -> dict:
+    """跑一条命令，统一返回 returncode / stdout / stderr / timed_out。"""
+    # 强制子进程用 UTF-8 输出，否则 Windows 上中文输出按 GBK 编码会导致解码崩溃
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+        return {"returncode": result.returncode, "stdout": result.stdout,
+                "stderr": result.stderr, "timed_out": False}
+    except FileNotFoundError:
+        return {"returncode": -1, "stdout": "", "stderr": f"命令不存在: {cmd[0]}（未安装或不在 PATH）", "timed_out": False}
+    except subprocess.TimeoutExpired as e:
+        return {"returncode": -1, "stdout": e.stdout or "", "stderr": e.stderr or "", "timed_out": True}
+
+
+def run_file(path: str, timeout: int = 30) -> dict:
+    """按文件后缀选运行方式：.py/.js 直接跑，.cpp/.c 先编译再跑，其余不支持。"""
     try:
         p = _safe_resolve(path)
     except ValueError as e:
-        return {"returncode": -1, "stdout": "", "stderr": f"运行被拒绝：{e}"}
-    # 强制子进程用 UTF-8 输出，否则 Windows 上中文输出按 GBK 编码会导致解码崩溃
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
-    result = subprocess.run(
-        ["python", str(p)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        env=env,
-    )
-    return {
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+        return {"returncode": -1, "stdout": "", "stderr": f"运行被拒绝：{e}", "timed_out": False}
+    suffix = p.suffix.lower()
+    if suffix == ".py":
+        return _run_cmd(["python", str(p)], timeout)
+    if suffix == ".js":
+        return _run_cmd(["node", str(p)], timeout)
+    if suffix in (".cpp", ".cc", ".cxx"):
+        exe = p.with_suffix(".exe")
+        # 多文件支持：入口 + 同目录其他 C++ 源文件一起编译链接（避免"未定义的引用"）
+        sources = [str(p)]
+        for pat in ("*.cpp", "*.cc", "*.cxx"):
+            sources.extend(str(f) for f in p.parent.glob(pat) if f != p)
+        comp = _run_cmd(["g++", *sources, "-o", str(exe)], timeout)
+        if comp["returncode"] != 0:
+            return comp
+        return _run_cmd([str(exe)], timeout)
+    if suffix == ".c":
+        exe = p.with_suffix(".exe")
+        comp = _run_cmd(["gcc", str(p), "-o", str(exe)], timeout)
+        if comp["returncode"] != 0:
+            return comp
+        return _run_cmd([str(exe)], timeout)
+    return {"returncode": -1, "stdout": "", "stderr": f"不支持运行 {suffix} 文件（支持 .py / .js / .cpp / .c）", "timed_out": False}
 
 FILE_TOOLS = [list_files, read_file, edit_file, write_file]
 # 普通函数没有 .name，用 __name__；react.py 执行时兼容普通函数

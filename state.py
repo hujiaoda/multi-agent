@@ -20,5 +20,10 @@ class DevTeamState(TypedDict):
 
     files: list[str] #工作目录下的文件列表
     entry_file: str #工作目录下的入口文件（相对路径）
+    
+    complexity: float #plan 复杂度 0~1（>=阈值才问用户确认方案）
+    plan_summary: str #plan 的简洁摘要（给用户快速确认用）
+    steering: str #用户对方案的修改意见（空=按原方案继续）
+    user_decision: str #重试到上限时用户的选择（继续/重新规划/放弃）
 class agentstate(DevTeamState):
     messages:Annotated[list,add_messages]

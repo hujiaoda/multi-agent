@@ -28,3 +28,12 @@ qwen_model = ChatOpenAI(
 
 # with_structured_output 返回的不再是字符串，而是 ClarifyDecision 对象
 clarify_model = qwen_model.with_structured_output(ClarifyDecision)
+
+
+class PlanComplexityDecision(BaseModel):
+    """plan 节点的复杂度判定结果：分数 + 压缩摘要一次返回"""
+    complexity: float = Field(description="任务复杂度 0~1：简单函数≈0.1，单文件小工具≈0.4，多模块/游戏/网站≈0.8")
+    summary: str = Field(description="方案的简洁摘要（100 字以内），给用户快速确认用")
+
+
+complexity_model = qwen_model.with_structured_output(PlanComplexityDecision)

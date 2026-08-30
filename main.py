@@ -9,9 +9,11 @@ from datetime import datetime
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
+from langgraph.types import Command
 
 from graph import app, MAX_CLARIFY
 from tools import set_workspace
+from memory import save_run
 
 DEFAULT_REQU = "写一个命令行版贪吃蛇游戏，用方向键控制，分数实时显示"
 
@@ -52,13 +54,18 @@ def main():
         "messages": messages,
         "clarify_count": 0,
     }
-    # 需求澄清循环：clarify 说信息不足 → 打印问题 → 收用户回答 → 重新跑一遍图
+    # 运行循环：一次运行 = 多次 stream 调用。
+    # - 正常/澄清：用 state 重新开始
+    # - interrupt 恢复：用 Command(resume=答案) 从暂停点继续（checkpointer 保证不重跑）
+    config = {"configurable": {"thread_id": run_id}}
+    pending = None       # 非空 = 上一次 interrupt 的恢复指令
+    final_state = {}
     while True:
-        final_state = {}
         need_ask = False
-
+        inputs = pending if pending is not None else state
+        pending = None
         # 双模式流式：messages = 模型逐字输出；updates = 节点完成时汇报字段
-        for mode, chunk in app.stream(state, stream_mode=["updates", "messages"]):
+        for mode, chunk in app.stream(inputs, stream_mode=["updates", "messages"], config=config):
             if mode == "messages":
                 # chunk 是 (消息片段, 元数据)，片段通常是几个字/token
                 msg, metadata = chunk
@@ -67,7 +74,19 @@ def main():
                     text = msg.content if isinstance(msg.content, str) else ""
                     if text.strip() and not text.strip().startswith(("{", "[")):
                         print(text, end="", flush=True)
+            elif mode == "__interrupt__":
+                # 部分版本 interrupt 会以独立模式出现，兜底分支
+                print(f"\n{chunk[0].value['question']}")
+                answer = input("你的回答：").strip()
+                pending = Command(resume=answer)   # 下一轮 stream 从暂停点继续
+                break                              # 本轮 stream 到此为止
             else:  # mode == "updates"
+                # langgraph 1.2.10：多模式下 interrupt 以 updates 里的特殊 key 出现
+                if "__interrupt__" in chunk:
+                    print(f"\n{chunk['__interrupt__'][0].value['question']}")
+                    answer = input("你的回答：").strip()
+                    pending = Command(resume=answer)
+                    break
                 # chunk 是 {节点名: 该节点更新的字段}，每次只有一个节点
                 node_name, update = next(iter(chunk.items()))
                 print(f"\n===== {node_name} 节点更新 =====")
@@ -81,6 +100,9 @@ def main():
                 final_state.update(update)
                 if node_name == "clarify" and update.get("need_more_info"):
                     need_ask = True
+
+        if pending is not None:
+            continue       # 刚被 interrupt 暂停 → 用 Command 继续，不进 clarify 分支
 
         # 信息足够（或问够了）→ 图已经一路跑到结束，退出循环
         if not need_ask or final_state.get("clarify_count", 0) >= MAX_CLARIFY:
@@ -96,6 +118,25 @@ def main():
             "messages": messages,
             "clarify_count": final_state.get("clarify_count", 0),
         }
+
+    # 运行结束：存一条记忆（成败都存；失败记录更有价值，踩坑字段存失败原因）
+    try:
+        passed = bool(final_state.get("tests_passed"))
+        pitfall = ""
+        if not passed:
+            pitfall = (final_state.get("test_result") or final_state.get("review") or "")[:200]
+        save_run(
+            run_id=run_id,
+            requirement=requ,
+            plan_summary=final_state.get("plan_summary", ""),
+            files=final_state.get("files", []),
+            result="通过" if passed else "失败",
+            pitfall=pitfall,
+            workdir=str(work_dir),
+        )
+        print(f"已存入记忆库: memory/{run_id}.json")
+    except Exception as e:
+        print(f"记忆存档失败（不影响本次结果）: {e}")
 
     print("\n========== 最终结论 ==========")
     print("审查通过:", final_state.get("review_passed"))
